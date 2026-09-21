@@ -22,12 +22,10 @@ app.use((req, res, next) => {
   next();
 });
 
-// Health check
 app.get('/health', (req, res) => {
   res.json({ ok: true, timestamp: new Date().toISOString() });
 });
 
-// OAuth Install Route
 app.get('/install', (req, res) => {
   const shop = req.query.shop || SHOPIFY_SHOP;
   const scopes = 'read_products,write_products,read_orders,read_customers';
@@ -36,38 +34,22 @@ app.get('/install', (req, res) => {
   res.redirect(authUrl);
 });
 
-// OAuth Callback
 app.get('/auth/callback', async (req, res) => {
   const { code, shop, hmac } = req.query;
   const message = Object.keys(req.query).filter(k => k !== 'hmac').sort().map(k => `${k}=${req.query[k]}`).join('&');
   const calculatedHmac = crypto.createHmac('sha256', SHOPIFY_CLIENT_SECRET).update(message).digest('hex');
-  
-  if (calculatedHmac !== hmac) {
-    return res.status(401).send('Invalid HMAC');
-  }
-  
+  if (calculatedHmac !== hmac) return res.status(401).send('Invalid HMAC');
   const tokenUrl = `https://${shop}/admin/oauth/access_token`;
   const tokenRes = await fetch(tokenUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      client_id: SHOPIFY_CLIENT_ID,
-      client_secret: SHOPIFY_CLIENT_SECRET,
-      code: code
-    })
+    body: JSON.stringify({ client_id: SHOPIFY_CLIENT_ID, client_secret: SHOPIFY_CLIENT_SECRET, code: code })
   });
-  
   const tokenData = await tokenRes.json();
-  
   if (tokenData.access_token) {
     ACCESS_TOKEN = tokenData.access_token;
     console.log('✅ Access token obtained!');
-    res.json({
-      success: true,
-      message: 'App installed successfully!',
-      access_token: ACCESS_TOKEN,
-      instruction: 'Copy the access_token and add it to .env as SHOPIFY_ACCESS_TOKEN'
-    });
+    res.json({ success: true, message: 'App installed!', access_token: ACCESS_TOKEN, instruction: 'Copy the access_token and add it to .env as SHOPIFY_ACCESS_TOKEN' });
   } else {
     res.status(500).json({ error: 'Failed to get token', details: tokenData });
   }
@@ -99,24 +81,42 @@ function verifyProxy(req, res, next) {
   next();
 }
 
+// ============================================
+// GET /product - Fetch reviews
+// ============================================
 app.get('/product', verifyProxy, async (req, res) => {
   try {
     const productId = req.query.product_id;
     if (!productId) return res.status(400).json({ success: false, message: 'Missing product_id' });
-    const query = `query GetProductReviews($id: ID!) { product(id: $id) { metafield(namespace: "custom", key: "reviews_list") { value } } }`;
+
+    const query = `query GetProductReviews($id: ID!) {
+      product(id: $id) { metafield(namespace: "custom", key: "reviews_list") { value } }
+    }`;
     const data = await shopifyGraphQL(query, { id: `gid://shopify/Product/${productId}` });
+
     let reviews = [];
     if (data.product && data.product.metafield && data.product.metafield.value) {
       try { reviews = JSON.parse(data.product.metafield.value); } catch (e) { reviews = []; }
       if (!Array.isArray(reviews)) reviews = [];
     }
+
     let alreadyReviewed = req.customerId ? reviews.some(r => r.customer_id === req.customerId) : false;
-    let eligible = false;
-    if (req.customerId) eligible = await checkPurchase(req.customerId, productId);
+    
+    // Check if customer purchased (for verified badge)
+    let verified = false;
+    if (req.customerId) {
+      verified = await checkPurchase(req.customerId, productId);
+    }
+
     res.json({
       success: true,
       reviews: reviews.map(r => ({ name: r.name, rating: r.rating, title: r.title, body: r.body, date: r.date, verified: r.verified || false })),
-      customer: { logged_in: !!req.customerId, eligible, already_reviewed: alreadyReviewed }
+      customer: { 
+        logged_in: !!req.customerId, 
+        eligible: true,  // ✅ Allow ALL logged-in customers to review
+        already_reviewed: alreadyReviewed,
+        verified_buyer: verified  // Only verified buyers get the badge
+      }
     });
   } catch (err) {
     console.error('[GET] Error:', err.message);
@@ -124,6 +124,9 @@ app.get('/product', verifyProxy, async (req, res) => {
   }
 });
 
+// ============================================
+// POST /submit - Create review
+// ============================================
 app.post('/submit', verifyProxy, async (req, res) => {
   try {
     const customerId = req.customerId;
@@ -134,8 +137,11 @@ app.post('/submit', verifyProxy, async (req, res) => {
     if (isNaN(r) || r < 1 || r > 5) return res.status(400).json({ success: false, message: 'Rating must be 1-5.' });
     if (!title || !title.trim()) return res.status(400).json({ success: false, message: 'Title required.' });
     if (!body || !body.trim()) return res.status(400).json({ success: false, message: 'Review body required.' });
+
+    // Check if customer purchased (for verified badge)
     const purchased = await checkPurchase(customerId, product_id);
-    if (!purchased) return res.status(403).json({ success: false, message: 'You must purchase this product first.' });
+    console.log('[SUBMIT] Customer purchased:', purchased);
+
     const readQuery = `query GetReviews($id: ID!) { product(id: $id) { metafield(namespace: "custom", key: "reviews_list") { value } } }`;
     const readData = await shopifyGraphQL(readQuery, { id: `gid://shopify/Product/${product_id}` });
     let reviews = [];
@@ -146,31 +152,104 @@ app.post('/submit', verifyProxy, async (req, res) => {
     if (reviews.some(rv => rv.customer_id === customerId)) {
       return res.status(409).json({ success: false, message: 'You already reviewed this product.' });
     }
+
     const cleanTitle = title.trim().replace(/</g, '&lt;').replace(/>/g, '&gt;');
     const cleanBody = body.trim().replace(/</g, '&lt;').replace(/>/g, '&gt;');
     const cleanName = (name || 'Customer').trim().replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    reviews.push({ customer_id: customerId, name: cleanName, rating: r, title: cleanTitle, body: cleanBody, date: new Date().toISOString(), verified: true });
-    const writeMutation = `mutation UpdateProductMetafield($input: ProductInput!) { productUpdate(input: $input) { product { id } userErrors { field message } } }`;
-    const writeData = await shopifyGraphQL(writeMutation, { input: { id: `gid://shopify/Product/${product_id}`, metafields: [{ namespace: 'custom', key: 'reviews_list', type: 'json', value: JSON.stringify(reviews) }] } });
+
+    reviews.push({ 
+      customer_id: customerId, 
+      name: cleanName, 
+      rating: r, 
+      title: cleanTitle, 
+      body: cleanBody, 
+      date: new Date().toISOString(), 
+      verified: purchased  // ✅ Only verified if actually purchased
+    });
+
+    const writeMutation = `mutation UpdateProductMetafield($input: ProductInput!) {
+      productUpdate(input: $input) { product { id } userErrors { field message } }
+    }`;
+    const writeData = await shopifyGraphQL(writeMutation, {
+      input: {
+        id: `gid://shopify/Product/${product_id}`,
+        metafields: [{ namespace: 'custom', key: 'reviews_list', type: 'json', value: JSON.stringify(reviews) }]
+      }
+    });
     if (writeData.productUpdate.userErrors.length > 0) throw new Error(writeData.productUpdate.userErrors.map(e => e.message).join(', '));
-    res.json({ success: true, message: 'Thank you for your review!' });
+
+    res.json({ success: true, message: 'Thank you for your review! Your review has been published.' });
   } catch (err) {
     console.error('[POST] Error:', err.message);
     res.status(500).json({ success: false, message: 'Failed to save review.' });
   }
 });
 
+// ============================================
+// Check if customer purchased a product
+// ============================================
 async function checkPurchase(customerId, productId) {
   try {
-    const query = `query CheckPurchase($customerId: ID!) { customer(id: $customerId) { orders(first: 50, reverse: true, query: "financial_status:paid") { edges { node { lineItems(first: 50) { edges { node { product { id } } } } } } } } }`;
+    console.log('[PURCHASE] Checking customer:', customerId, 'product:', productId);
+    
+    const query = `
+      query CheckPurchase($customerId: ID!) {
+        customer(id: $customerId) {
+          id
+          orders(first: 100, reverse: true) {
+            edges {
+              node {
+                id
+                financialStatus
+                lineItems(first: 100) {
+                  edges {
+                    node {
+                      product { id }
+                      variant { product { id } }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    `;
+    
     const data = await shopifyGraphQL(query, { id: `gid://shopify/Customer/${customerId}` });
-    if (!data.customer) return false;
+    
+    console.log('[PURCHASE] Customer found:', !!data.customer);
+    
+    if (!data.customer) {
+      console.log('[PURCHASE] Customer not found');
+      return false;
+    }
+
     const productGid = `gid://shopify/Product/${productId}`;
+    console.log('[PURCHASE] Looking for:', productGid);
+
+    let orderCount = 0;
+    let lineItemCount = 0;
+
     for (const orderEdge of data.customer.orders.edges) {
-      for (const lineEdge of orderEdge.node.lineItems.edges) {
-        if (lineEdge.node.product && lineEdge.node.product.id === productGid) return true;
+      orderCount++;
+      const order = orderEdge.node;
+      console.log('[PURCHASE] Order:', order.id, 'Status:', order.financialStatus);
+      
+      for (const lineEdge of order.lineItems.edges) {
+        lineItemCount++;
+        const lineItem = lineEdge.node;
+        const lineProductId = lineItem.product?.id || lineItem.variant?.product?.id;
+        console.log('[PURCHASE] Line item:', lineProductId);
+        
+        if (lineProductId === productGid) {
+          console.log('[PURCHASE] ✅ MATCH FOUND!');
+          return true;
+        }
       }
     }
+
+    console.log('[PURCHASE] Checked', orderCount, 'orders,', lineItemCount, 'line items. No match.');
     return false;
   } catch (err) {
     console.error('[PURCHASE] Error:', err.message);
@@ -182,8 +261,8 @@ app.use((req, res) => res.status(404).json({ success: false, message: 'Not found
 
 app.listen(PORT, () => {
   console.log('✅ Server running on port', PORT);
-  console.log(' Shop:', SHOPIFY_SHOP || 'MISSING');
-  console.log('🔑 Client ID:', SHOPIFY_CLIENT_ID ? 'Set ✓' : 'MISSING ✗');
-  console.log('🔐 Secret:', SHOPIFY_CLIENT_SECRET ? 'Set ✓' : 'MISSING ✗');
-  console.log('🎫 Token:', ACCESS_TOKEN ? 'Set ✓' : 'NOT SET - Visit /install');
+  console.log('📦 Shop:', SHOPIFY_SHOP || 'MISSING');
+  console.log(' Client ID:', SHOPIFY_CLIENT_ID ? 'Set ✓' : 'MISSING ✗');
+  console.log('🔐 Secret:', SHOPIFY_CLIENT_SECRET ? 'Set ✓' : 'MISSING ');
+  console.log('🎫 Token:', ACCESS_TOKEN ? 'Set ✓' : 'NOT SET');
 });
