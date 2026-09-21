@@ -6,9 +6,12 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 
 const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP_DOMAIN;
-const SHOPIFY_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
-const SHOPIFY_SECRET = process.env.SHOPIFY_API_SECRET_KEY;
+const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
+const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || '2026-07';
+
+// Store access token (will be set after OAuth)
+let ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN || '';
 
 app.use(express.json({ limit: '50kb' }));
 
@@ -20,24 +23,102 @@ app.use((req, res, next) => {
   next();
 });
 
+// Health check
 app.get('/health', (req, res) => {
-  console.log('[HEALTH] OK');
   res.json({ ok: true, timestamp: new Date().toISOString() });
 });
 
+// ============================================
+// OAuth Install Route
+// ============================================
+app.get('/install', (req, res) => {
+  const shop = req.query.shop || SHOPIFY_SHOP;
+  const scopes = 'read_products,write_products,read_orders,read_customers';
+  const redirectUri = `${req.protocol}://${req.get('host')}/auth/callback`;
+  
+  const authUrl = `https://${shop}/admin/oauth/authorize?client_id=${SHOPIFY_CLIENT_ID}&scope=${scopes}&redirect_uri=${encodeURIComponent(redirectUri)}`;
+  
+  res.redirect(authUrl);
+});
+
+// ============================================
+// OAuth Callback
+// ============================================
+app.get('/auth/callback', async (req, res) => {
+  const { code, shop, hmac } = req.query;
+  
+  // Verify HMAC
+  const message = Object.keys(req.query).filter(k => k !== 'hmac').sort().map(k => `${k}=${req.query[k]}`).join('&');
+  const calculatedHmac = crypto.createHmac('sha256', SHOPIFY_CLIENT_SECRET).update(message).digest('hex');
+  
+  if (calculatedHmac !== hmac) {
+    return res.status(401).send('Invalid HMAC');
+  }
+  
+  // Exchange code for token
+  const tokenUrl = `https://${shop}/admin/oauth/access_token`;
+  const tokenRes = await fetch(tokenUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      client_id: SHOPIFY_CLIENT_ID,
+      client_secret: SHOPIFY_CLIENT_SECRET,
+      code: code
+    })
+  });
+  
+  const tokenData = await tokenRes.json();
+  
+  if (tokenData.access_token) {
+    ACCESS_TOKEN = tokenData.access_token;
+    console.log('✅ Access token obtained:', ACCESS_TOKEN.substring(0, 20) + '...');
+    console.log('⚠️ Copy this token and add it to your .env file as SHOPIFY_ACCESS_TOKEN');
+    
+    res.json({
+      success: true,
+      message: 'App installed successfully!',
+      access_token: ACCESS_TOKEN,
+      instruction: 'Copy the access_token above and add it to your .env file as SHOPIFY_ACCESS_TOKEN'
+    });
+  } else {
+    res.status(500).json({ error: 'Failed to get access token', details: tokenData });
+  }
+});
+
+// ============================================
+// Shopify GraphQL Helper
+// ============================================
+async function shopifyGraphQL(query, variables = {}) {
+  if (!ACCESS_TOKEN) {
+    throw new Error('No access token. Visit /install first to authenticate.');
+  }
+  
+  const url = `https://${SHOPIFY_SHOP}/admin/api/${API_VERSION}/graphql.json`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Shopify-Access-Token': ACCESS_TOKEN,
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  const data = await res.json();
+  if (data.errors) throw new Error(JSON.stringify(data.errors));
+  return data.data;
+}
+
+// ============================================
+// Proxy Verification Middleware
+// ============================================
 function verifyProxy(req, res, next) {
   const { signature, ...params } = req.query;
-
-  console.log('[PROXY] Request:', req.method, req.path);
-  console.log('[PROXY] Shop:', req.query.shop);
-  console.log('[PROXY] Customer ID:', req.query.logged_in_customer_id || 'guest');
 
   if (!signature) {
     return res.status(401).json({ success: false, message: 'Missing signature.' });
   }
 
   const message = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join('');
-  const hmac = crypto.createHmac('sha256', SHOPIFY_SECRET).update(message).digest('hex');
+  const hmac = crypto.createHmac('sha256', SHOPIFY_CLIENT_SECRET).update(message).digest('hex');
 
   if (!crypto.timingSafeEqual(Buffer.from(hmac), Buffer.from(signature))) {
     return res.status(401).json({ success: false, message: 'Invalid signature.' });
@@ -48,21 +129,9 @@ function verifyProxy(req, res, next) {
   next();
 }
 
-async function shopifyGraphQL(query, variables = {}) {
-  const url = `https://${SHOPIFY_SHOP}/admin/api/${API_VERSION}/graphql.json`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Shopify-Access-Token': SHOPIFY_TOKEN,
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-  const data = await res.json();
-  if (data.errors) throw new Error(JSON.stringify(data.errors));
-  return data.data;
-}
-
+// ============================================
+// GET /product - Fetch reviews
+// ============================================
 app.get('/product', verifyProxy, async (req, res) => {
   try {
     const productId = req.query.product_id;
@@ -102,6 +171,9 @@ app.get('/product', verifyProxy, async (req, res) => {
   }
 });
 
+// ============================================
+// POST /submit - Create review
+// ============================================
 app.post('/submit', verifyProxy, async (req, res) => {
   try {
     const customerId = req.customerId;
@@ -175,6 +247,9 @@ app.post('/submit', verifyProxy, async (req, res) => {
   }
 });
 
+// ============================================
+// Check Purchase
+// ============================================
 async function checkPurchase(customerId, productId) {
   try {
     const query = `
@@ -209,6 +284,7 @@ app.use((req, res) => {
 app.listen(PORT, () => {
   console.log('✅ Reviews server running on port', PORT);
   console.log('📦 Shop:', SHOPIFY_SHOP || 'MISSING');
-  console.log('🔑 Token:', SHOPIFY_TOKEN ? 'Set ✓' : 'MISSING ✗');
-  console.log('🔐 Secret:', SHOPIFY_SECRET ? 'Set ✓' : 'MISSING ✗');
+  console.log('🔑 Client ID:', SHOPIFY_CLIENT_ID ? 'Set ✓' : 'MISSING ✗');
+  console.log('🔐 Secret:', SHOPIFY_CLIENT_SECRET ? 'Set ✓' : 'MISSING ✗');
+  console.log('🎫 Access Token:', ACCESS_TOKEN ? 'Set ✓' : 'NOT SET - Visit /install to authenticate');
 });
